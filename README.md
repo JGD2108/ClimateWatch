@@ -21,7 +21,9 @@ Build a simple but real cloud data pipeline that demonstrates:
 - **Storage**: Amazon S3
 - **Current layers**:
   - `raw/weather/`
+  - `curated/weather/`
   - `audit/weather/`
+  - `audit/curated_weather/`
 
 ## Diagram
 
@@ -111,6 +113,218 @@ audit/weather/year=YYYY/month=MM/day=DD/weather_run_<timestamp>.json
 }
 ```
 
+## Parte 2: Transformacion serverless a capa curated
+
+### Descripcion
+
+La segunda fase del proyecto mueve la transformacion de datos desde una prueba local a una arquitectura serverless en AWS.
+
+En esta etapa, los archivos `raw` generados por la Lambda de ingestion son leidos desde Amazon S3, transformados a un formato tabular por hora y guardados como archivos CSV en una capa `curated`. Ademas, cada corrida genera un archivo de auditoria para trazabilidad del proceso.
+
+### Objetivo
+
+Convertir los archivos meteorologicos `raw` almacenados en S3 en una capa `curated` lista para analisis, evitando reprocesamientos innecesarios y manteniendo auditoria por corrida.
+
+### Que hace esta fase
+
+La Lambda de transformacion:
+
+- lista los archivos `raw` disponibles en `raw/weather/`
+- identifica cuales aun no tienen un archivo `curated` correspondiente
+- lee cada JSON `raw` desde S3
+- valida que el bloque `hourly` contenga las columnas esperadas
+- transforma las listas paralelas del bloque `hourly` en filas tabulares
+- genera un CSV por archivo `raw`
+- guarda el resultado en `curated/weather/`
+- genera un archivo de auditoria en `audit/curated_weather/`
+
+### Logica de transformacion
+
+Cada archivo `raw` contiene un bloque `hourly` con listas alineadas por indice, por ejemplo:
+
+- `time`
+- `temperature_2m`
+- `relative_humidity_2m`
+- `precipitation_probability`
+- `cloud_cover`
+- `wind_speed_10m`
+
+La transformacion convierte esas listas en una estructura tabular con una fila por hora.
+
+### Columnas del dataset curated
+
+Cada fila del CSV `curated` contiene:
+
+- `city`
+- `ingestion_timestamp`
+- `time`
+- `temperature_2m`
+- `relative_humidity_2m`
+- `precipitation_probability`
+- `cloud_cover`
+- `wind_speed_10m`
+
+#### Significado de columnas clave
+
+- `city`: ciudad asociada al archivo raw procesado
+- `ingestion_timestamp`: timestamp de la corrida de ingestion que genero el raw
+- `time`: timestamp horario del forecast meteorologico
+
+### Validaciones implementadas
+
+Antes de escribir el archivo `curated`, la Lambda valida:
+
+- que exista el bloque `hourly`
+- que esten presentes todas las columnas esperadas
+- que todas las listas del bloque `hourly` tengan la misma longitud
+- que el archivo `curated` no exista previamente, para evitar reprocesamiento
+
+### Estrategia incremental
+
+La transformacion fue disenada como un proceso incremental.
+
+Para cada archivo `raw`, la Lambda calcula cual deberia ser su archivo `curated` correspondiente. Si ese archivo ya existe en S3, el archivo se marca como `skipped`. Si no existe, se transforma y se guarda.
+
+Esto permite que la Lambda procese unicamente archivos pendientes y mantenga una logica idempotente basica.
+
+### Estructura en S3
+
+#### Raw
+
+```text
+raw/weather/year=YYYY/month=MM/day=DD/weather_<city>_<timestamp>.json
+```
+
+#### Curated
+
+```text
+curated/weather/year=YYYY/month=MM/day=DD/weather_curated_<city>_<timestamp>.csv
+```
+
+#### Audit de transformacion
+
+```text
+audit/curated_weather/year=YYYY/month=MM/day=DD/curated_weather_run_<timestamp>.json
+```
+
+### Variables de entorno de la Lambda de transformacion
+
+La funcion `weather_transform_lambda` usa estas variables de entorno:
+
+- `S3_BUCKET`
+- `RAW_PREFIX`
+- `CURATED_PREFIX`
+- `CURATED_AUDIT_PREFIX`
+
+Valores usados en esta version:
+
+```text
+S3_BUCKET=climatewatch-colombia-dev
+RAW_PREFIX=raw/weather/
+CURATED_PREFIX=curated/weather/
+CURATED_AUDIT_PREFIX=audit/curated_weather/
+```
+
+### Archivo principal
+
+La logica de esta fase vive en:
+
+```text
+src/transformation/weather_transform_lambda.py
+```
+
+### Funciones principales
+
+#### `get_all_raw_keys()`
+
+Lista todos los archivos JSON disponibles en la capa `raw/weather/`.
+
+#### `parse_weather_file_name_from_key(raw_key)`
+
+Extrae `city_slug` y `timestamp` desde el nombre del archivo raw.
+
+#### `get_curated_output_key(raw_key)`
+
+Construye la key esperada del archivo `curated` correspondiente.
+
+#### `s3_key_exists(key)`
+
+Verifica si un objeto ya existe en S3 para evitar reprocesamiento.
+
+#### `transform_raw_object(raw_key, curated_key)`
+
+Lee un raw desde S3, valida su estructura, transforma el bloque `hourly` a CSV y sube el resultado a S3.
+
+#### `save_transform_audit_report(run_timestamp, raw_files_found, results)`
+
+Guarda el resumen de la corrida de transformacion en la capa de auditoria.
+
+#### `run_transformation()`
+
+Orquesta todo el flujo:
+
+- lista raws
+- determina pendientes
+- transforma
+- guarda auditoria
+- devuelve resumen final
+
+#### `lambda_handler(event, context)`
+
+Punto de entrada para AWS Lambda.
+
+### Automatizacion
+
+La Lambda de transformacion se ejecuta automaticamente con EventBridge Scheduler en zona horaria `America/Bogota`.
+
+Horarios configurados:
+
+- 08:05
+- 13:05
+- 18:05
+
+Esto permite que la transformacion corra pocos minutos despues de la Lambda de ingestion.
+
+### Resultado esperado de una corrida
+
+Ejemplo de respuesta de la Lambda:
+
+```json
+{
+  "run_timestamp": "20260422T041316",
+  "bucket": "climatewatch-colombia-dev",
+  "raw_files_found": 12,
+  "files_transformed": 12,
+  "files_skipped": 0,
+  "files_failed": 0,
+  "audit_key": "audit/curated_weather/year=2026/month=04/day=22/curated_weather_run_20260422T041316.json"
+}
+```
+
+### Decisiones de diseno
+
+En esta fase no se uso `pandas` dentro de Lambda.
+
+La transformacion se implemento con librerias estandar de Python (`csv`, `io`, `json`) para:
+
+- simplificar el empaquetado
+- reducir dependencias
+- hacer la Lambda mas liviana
+- evitar problemas innecesarios de despliegue
+
+### Aprendizajes de esta fase
+
+- como leer objetos desde S3 dentro de Lambda
+- como disenar una transformacion incremental en cloud
+- como construir una capa `curated` sin depender de pandas
+- como usar auditoria por corrida para trazabilidad
+- como separar capas `raw`, `curated` y `audit` en S3
+- como automatizar ingestion y transformacion con Lambdas separadas
+
+### Resumen corto para el repo
+
+La segunda fase del proyecto implementa una transformacion serverless en AWS que toma archivos `raw` meteorologicos desde S3, los convierte en archivos tabulares `curated` por hora, evita reprocesamiento innecesario y genera auditoria por corrida. Esta fase completa la base del pipeline end-to-end junto con la Lambda de ingestion.
+
 ## Project Structure
 
 ```text
@@ -127,8 +341,10 @@ ClimateWatch/
 |   |-- experiment_05_transform_raw_weather_to_curated_csv.py
 |   `-- experiment_06_test_s3_upload.py
 |-- src/
-|   `-- ingestion/
-|       `-- weather_ingestion_lambda.py
+|   |-- ingestion/
+|   |   `-- weather_ingestion_lambda.py
+|   `-- transformation/
+|       `-- weather_transform_lambda.py
 |-- .gitignore
 |-- requirements-lambda.txt
 |-- requirements.txt
@@ -182,10 +398,11 @@ This section explains what each file is and why it exists in the project.
 
 ## Next Steps
 
-- move the curated transformation layer to AWS
-- add stronger data-quality validations
-- build an analytical layer or simple dashboard on top of the ingested data
 - replace broad IAM permissions with minimum required policies
+- create an analytical layer that combines weather and air-quality data
+- build a dashboard or demo visualization on top of `curated/weather/`
+- add alerts and monitoring for transformation and ingestion failures
+- extend the pipeline with new data sources
 
 ## Notes
 
